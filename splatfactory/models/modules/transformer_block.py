@@ -7,12 +7,16 @@
 #   https://github.com/facebookresearch/dino/blob/master/vision_transformer.py
 #   https://github.com/rwightman/pytorch-image-models/tree/master/timm/layers/patch_embed.py
 
-from typing import Callable, Optional
+from typing import Callable, Optional, Union
 
 import torch
 from torch import Tensor, nn
 
-from splatfactory.models.modules.attention import CrossAttention, SelfAttention
+from splatfactory.models.modules.attention import (
+    CrossAttention,
+    MultiSourceCrossAttention,
+    SelfAttention,
+)
 from splatfactory.models.modules.drop_path import DropPath
 from splatfactory.models.modules.misc import LayerScale
 
@@ -177,14 +181,17 @@ class CrossAttentionBlock(nn.Module):
         qk_norm: bool = False,
         fused_attn: bool = True,
         attn_mode: str = "softmax",
+        num_sources: int = 1,
     ) -> None:
         super().__init__()
 
         self.norm_q = norm_layer(dim)
         self.norm_kv = norm_layer(dim)
+        self.num_sources = num_sources
 
-        self.attn = CrossAttention(
-            dim,
+        attn_cls = MultiSourceCrossAttention if num_sources > 1 else CrossAttention
+        attn_kwargs = dict(
+            dim=dim,
             num_heads=num_heads,
             qkv_bias=qkv_bias,
             proj_bias=proj_bias,
@@ -194,6 +201,9 @@ class CrossAttentionBlock(nn.Module):
             fused_attn=fused_attn,
             attn_mode=attn_mode,
         )
+        if num_sources > 1:
+            attn_kwargs["num_sources"] = num_sources
+        self.attn = attn_cls(**attn_kwargs)
 
         self.ls1 = LayerScale(dim, init_values=init_values) if init_values else nn.Identity()
         self.drop_path1 = DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
@@ -212,8 +222,8 @@ class CrossAttentionBlock(nn.Module):
 
     def forward(
         self,
-        queries: Tensor,
-        context: Tensor,
+        queries: Union[Tensor, list[Tensor], tuple[Tensor, ...]],
+        context: Union[Tensor, list[Tensor], tuple[Tensor, ...]],
         return_attention: bool = False,
         return_delta: bool = False,
     ) -> Tensor:
@@ -227,9 +237,26 @@ class CrossAttentionBlock(nn.Module):
         ZipSplat to inject a layer's CA contribution into a separate scene_tokens stream while
         using queries_l only as the attention query source (not as the residual anchor).
         """
+        multi_q = isinstance(queries, (list, tuple)) and self.num_sources > 1
+        if isinstance(queries, (list, tuple)):
+            q_in = (
+                self.norm_q(queries[0])
+                if self.num_sources == 1
+                else [self.norm_q(q) for q in queries]
+            )
+        else:
+            q_in = self.norm_q(queries)
+        if isinstance(context, (list, tuple)):
+            kv = (
+                self.norm_kv(context[0])
+                if self.num_sources == 1
+                else [self.norm_kv(c) for c in context]
+            )
+        else:
+            kv = self.norm_kv(context)
         attn_result = self.attn(
-            self.norm_q(queries),
-            self.norm_kv(context),
+            q_in,
+            kv,
             return_attention=return_attention,
         )
         if return_attention:
@@ -238,7 +265,8 @@ class CrossAttentionBlock(nn.Module):
             attn_out = attn_result
 
         attn_delta = self.drop_path1(self.ls1(attn_out))
-        post_attn = queries + attn_delta
+        # Multi-source: O already mixed the 3 head groups; FFN sees that mix.
+        post_attn = attn_out if multi_q else queries + attn_delta
         mlp_delta = self.drop_path2(self.ls2(self.mlp(self.norm2(post_attn))))
 
         if return_delta:

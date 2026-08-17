@@ -19,6 +19,9 @@ scene_init_layer: 0
 num_heads: ${eval:'${.backbone.embed_dim} // 64'}
 mlp_ratio: 4.0
 fuse_layer_scale: 0.01
+# false: original per-layer Q/KV. true: all layers as Q/KV (heads split evenly), mix at CA O+FFN.
+# true requires num_heads % num_layers == 0 (da3g/b/s ok; da3l 16 heads cannot).
+fuse_multi_source: false
 
 # Query clustering
 query_sample_ratio: [0.5, 1.0]

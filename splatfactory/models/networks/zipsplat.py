@@ -63,6 +63,8 @@ class ZipSplat(BaseModel):
         "num_heads": 24,
         "mlp_ratio": 4.0,
         "fuse_layer_scale": 0.01,
+        # false: original per-layer Q/KV. true: all layers as Q/KV, mix at CA O+FFN.
+        "fuse_multi_source": False,
         # Query clustering (compression knob)
         "query_sample_ratio": [1.0, 1.0],
         "query_ratio_schedule": 0.5,
@@ -134,7 +136,7 @@ class ZipSplat(BaseModel):
         )
         logger.info(
             f"  clustering_layer={conf.clustering_layer}, scene_init_layer={conf.scene_init_layer}, "
-            f"fuse_layer_scale={conf.fuse_layer_scale}"
+            f"fuse_layer_scale={conf.fuse_layer_scale}, fuse_multi_source={conf.fuse_multi_source}"
         )
 
     def _setup_backbone(self, conf):
@@ -161,6 +163,7 @@ class ZipSplat(BaseModel):
                     qk_norm=True,
                     attn_mode="softmax",
                     init_values=conf.fuse_layer_scale,
+                    num_sources=num_layers if conf.fuse_multi_source else 1,
                 )
                 for _ in range(num_layers)
             ]
@@ -346,7 +349,10 @@ class ZipSplat(BaseModel):
     # ============================================================
 
     def _fuse(self, features):
-        """Main geometry fusion with layer-specific queries.
+        """Main geometry fusion.
+
+        `fuse_multi_source=False`: original per-layer Q/KV.
+        `fuse_multi_source=True`: Q and KV from all backbone layers, mixed at CA O+FFN.
 
         Returns dict with:
           - scene_tokens: [B, K, D] final geometry stream
@@ -368,29 +374,36 @@ class ZipSplat(BaseModel):
         attn_weights = [] if return_attn else None
         block_stats = {}
 
-        for l in range(self.num_layers):
-            keys_l = rearrange(layer_tokens[l], "B V T D -> B (V T) D")
-            queries_l = torch.gather(keys_l, 1, nearest_idx.unsqueeze(-1).expand(-1, -1, D))
+        keys_all = tuple(rearrange(t, "B V T D -> B (V T) D") for t in layer_tokens)
+        idx = nearest_idx.unsqueeze(-1).expand(-1, -1, D)
+        multi = self.conf.fuse_multi_source
+        queries_all = tuple(torch.gather(k, 1, idx) for k in keys_all) if multi else None
 
-            # CA returns the gamma-gated delta added to the scene-token residual stream.
+        for l in range(self.num_layers):
+            if multi:
+                queries, keys = queries_all, keys_all
+            else:
+                keys = keys_all[l]
+                queries = torch.gather(keys, 1, idx)
+
             if use_ckpt:
                 update = ckpt(
                     self._ca_delta_step,
                     l,
-                    queries_l,
-                    keys_l,
+                    queries,
+                    keys,
                     use_reentrant=False,
                 )
             elif return_attn:
                 update, attn = self.cross_attention[l](
-                    queries_l,
-                    keys_l,
+                    queries,
+                    keys,
                     return_delta=True,
                     return_attention=True,
                 )
                 attn_weights.append(attn)
             else:
-                update = self.cross_attention[l](queries_l, keys_l, return_delta=True)
+                update = self.cross_attention[l](queries, keys, return_delta=True)
 
             # Track contribution ratio (||update|| / ||scene_tokens||).
             with torch.no_grad():
@@ -418,9 +431,9 @@ class ZipSplat(BaseModel):
             "block_stats": block_stats,
         }
 
-    def _ca_delta_step(self, l, queries_l, keys_l):
+    def _ca_delta_step(self, l, queries, keys):
         """Checkpointable wrapper for a single CA delta pass."""
-        return self.cross_attention[l](queries_l, keys_l, return_delta=True)
+        return self.cross_attention[l](queries, keys, return_delta=True)
 
     # ============================================================
     # Forward
